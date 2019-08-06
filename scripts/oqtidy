@@ -1,0 +1,45 @@
+#!/bin/bash
+#
+# Runs perltidy used by travis (openqa tests)
+# Requeres one parameter
+# If parameter is directory, recursive tidy all pm files there
+# If parameter is file, tidy file
+
+set -o nounset
+set -o noclobber
+
+# TIDY_ARGS="-b -l=0 -fbl -nsfs -baao -bbao -pt=2 -bt=2 -sbt=2 -sct"
+# TIDY_ARGS="-b -l=160 -fbl -nsfs -baao -bbao -pt=2 -bt=2 -sbt=2 -sct"
+TIDY_ARGS="-b -l=160 -fbl -fnl -nsfs -baao -bbao -pt=2 -bt=2 -sbt=2 -sct"
+
+if ! which perltidy > /dev/null 2>&1; then
+    echo "No perltidy found, install it first!"
+    exit 1
+fi
+
+# Without arguments clean only changed files
+if [ $# -eq 0 ]; then
+	fds=$(git diff --name-only | egrep "(t|pm)$")
+else
+	fds=$@
+fi
+
+for fd in $fds; do
+	echo "Cleaning $fd"
+	if [ -d "$fd" ]; then
+	    find "$fd" -name '*.pm' -print0 | xargs -0 perltidy $TIDY_ARGS
+	    find "$fd" -name '*.bak' -delete
+	elif [ -f "$fd" ]; then
+	    perltidy $TIDY_ARGS "$fd"
+	    rm "${fd%%.}.bak"
+	else
+	    echo "Bad argument: $fd"
+	    exit 1
+	fi
+done
+
+if [ -z "$fds" ]; then
+	echo "Nothing to clean."
+else
+	echo "Done."
+fi

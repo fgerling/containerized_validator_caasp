@@ -1,0 +1,462 @@
+#!/usr/bin/env bash
+set -eEuo pipefail
+
+# TESTs
+# check cilium pods are not killed when adding new node
+# remove powered off master node
+# reinstall node & add it to cluster (same ip, same mac)
+# check journal and services for errors
+
+# TODOs
+# run scripts on bootstrapped cluster (use existing workdir)
+# Run load test https://rio.io/ - go:hey linux:siege
+# Run script.sh from $PATH
+# Run from cron to test stability
+# add ssh key to keyring so I can run from screen http://rabexc.org/posts/pitfalls-of-ssh-agents
+# update system after installation?
+# SUSEConnect with scc-proxy?
+
+# If some magic fails
+# - problem with aliases in ENV setup?
+# - broken pipe with grep -qm, tail?
+
+usage() {
+    echo "Usage: $0 [ -p <platform> ] [ -t [=]<test> ] [ -j <tf_json> ] [ -n m:w ] [ -m ] [ -i -k -rR ]
+        -p Platform to be tested [openstack|vmware].
+           Used during customization of .../<platform>/terraform.tfstate
+        -j Path to json file that holds terraform output --json.
+           This option will skip terraform and use existing cluster
+        -t Testsuite to execute including. Use '=' to skip magic
+           none: run terraform only
+           join: build cluster from all available nodes
+           base: run join & cluster tests
+           sono: run join & sonobuoy tests
+           =<test>: skip magic, do what I say: (-t '=join,base,sono')
+        -n Use master:worker count for terraform deployment
+        -m Git pull --rebase & build skuba devel locally
+        -k Keep cluster, don't run terraform destroy
+        -i Install / Update required tools (jq, kubectl, sonobuoy, ..)
+        -r Show results for tested clusters. Capital R will destroy active deployments
+
+        Requirements: It's up to you to setup env for terraform and ssh-agent with key
+         - openstack: source container-openrc.sh
+         - vmware   : export VSPHERE_* variables
+         - ssh-agent: ssh-add ~/.ssh/id_shared
+
+        Examples:
+        Deploy cluster with 5 workers on vmware with IBS repositories, bootstrap & join & sonobuoy tests, destroy deployment
+         - $0 -p vmware -t sono -n 1:5
+
+        Use existing cluster and run bootstrap & join & basic tests on it
+         - $0 -j tfout.json -t base
+
+        Deploy on openstack, register with SCC, don't run any tests, keep deployment (release build)
+        Note that you need to destroy deployment manually afterwards (cd \$testdir/terraform && terraform destroy)
+         - SCC=INTERNAL-USE-ONLY-XXXXX $0 -t join -k
+
+        If SUFFIX=<user> is set it will overwrite <whoami> default - allows to multitask
+        If SCC=<key>     is set script will register with official SCC using <key>
+        If RMT=<fqdn>    is set script will register with your RMT <fqdn> server
+        Otherwise script will add IBS repos based on skuba version (development | staging | release)
+
+        To watch what's happening: multitail -Q 1 'cluster_*/logs/background.log'
+
+        Good Luck." 1>&2
+    exit 1
+}
+
+[[ -z "${OS_AUTH_URL:-}${VSPHERE_SERVER:-}" && -f "env_setup.sh" ]] && source "env_setup.sh"
+
+log  () { printf -- "\e[${1}m${2}\e[0m\n"; }
+info () { log 0  "  ${1}"; }
+step () { log 32 "${1} ($(date +%T))"; }
+warn () { log 33 "  ${1}"; }
+error() { log 31 "${1}"; }
+
+spinner() {
+    local pid=$!
+    i=0; s='-\|/'
+    printf "  $1 [.]"
+    while kill -0 $pid 2>/dev/null; do
+        i=$(( (i+1) %4 ))
+        # printf "\b\b\b[${s:$i:1}]"
+        printf "\b\b\b[${s:$i:1}]"
+        sleep 1
+    done
+    printf "\b\b\b[✓]\n"
+    wait $pid || { err=$?; error "Spinner task failed (exit $err)"; exit $err; }
+}
+
+dir_results() {
+    # Birth time if available, otherwise modification time
+    [ $(stat -c %W .) -ne 0 ] && fmt='W' || fmt='Y'
+    for d in $(stat -c "%$fmt %n" cluster_* | sort -rnk1 | cut -d' ' -f2); do
+        local result='?'
+        grep -sqE '\b(3.m)?PASSED\b' $d/logs/stdout.log && result='✓'
+        grep -sqE '\b(3.m)?FAILED\b' $d/logs/stdout.log && result='x'
+        jq -e '.modules[].resources != {}' $d/terraform/terraform.tfstate &>/dev/null && result="\e[5m●\e[0m"
+        local platform=$(grep -Eosm1 '/\b(vmware|openstack)\b' $d/logs/stdout.log | tr -d '/' ||:)
+
+        printf "%(%F %R)T: %s [$result] %s" $(stat -c"%$fmt" $d) $d ${platform}
+        if [ "${1:-}" = "rm" ] && [[ "$result" =~ '●' ]] && [ "${platform}" ]; then
+            (cd $d/terraform && terraform destroy -auto-approve >/dev/null) &
+            spinner ": destroying"
+        else
+            printf "\n"
+        fi
+    done
+    exit 0
+}
+
+# ==================================================================================================
+# REQUIRED VARS & ENV setup
+
+#RMT="saturn.qa.suse.cz"
+#SCC="INTERNAL-USE-ONLY-8d34bbefaa23c223"
+: ${SUFFIX:=$(whoami)}
+SSH_KEY="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC2G7k0zGAjd+0LzhbPcGLkdJrJ/LbLrFxtXe+LPAkrphizfRxdZpSC7Dvr5Vewrkd/kfYObiDc6v23DHxzcilVC2HGLQUNeUer/YE1mL4lnXC1M3cb4eU+vJ/Gyr9XVOOReDRDBCwouaL7IzgYNCsm0O5v2z/w9ugnRLryUY180/oIGeE/aOI1HRh6YOsIn7R3Rv55y8CYSqsbmlHWiDC6iZICZtvYLYmUmCgPX2Fg2eT+aRbAStUcUERm8h246fs1KxywdHHI/6o3E1NNIPIQ0LdzIn5aWvTCd6D511L4rf/k5zbdw/Gql0AygHBR/wnngB5gSDERLKfigzeIlCKf Unsafe Shared Key"
+
+MASTER_COUNT=1
+WORKER_COUNT=2
+TFDESTROY=1
+PLATFORM="openstack"
+TESTSUITE="join,base"
+while getopts "j:p:mn:t:rRki" opt; do
+    case $opt in
+        i)  INSTALL=true;;
+        p)  PLATFORM=$OPTARG;;
+        t)  [[ $OPTARG =~ ^(=|none|join) ]] && TESTSUITE=$OPTARG || TESTSUITE="join,$OPTARG";;
+        j)  JSON_FILE=$(realpath -e "$OPTARG")
+            unset TFDESTROY;;
+        m)  rpm -q --quiet skuba && { echo "You have RPM, I won't build skuba!"; exit 1; }
+            (cd ~/go/src/github.com/SUSE/skuba && git pull upstream master --rebase && make);;
+        n)  [ -n "${OPTARG%:*}" ] && MASTER_COUNT=${OPTARG%:*}
+            [ -n "${OPTARG#*:}" ] && WORKER_COUNT=${OPTARG#*:};;
+        k)  unset TFDESTROY;;
+        r)  dir_results;;
+        R)  dir_results 'rm';;
+        \?) usage;;
+    esac
+done
+[[ " $*" =~ ' -j' && " $*" =~ ' -'[npk] ]] && { echo "Invalid optons: -n -p -k does not work with -j"; exit 1; }
+
+BASEDIR="/app"
+WORKDIR="$(mktemp -d "$BASEDIR/cluster/cluster_XXX")"
+LOGPATH="$WORKDIR/logs"; mkdir "$LOGPATH"
+LOGFILE="$LOGPATH/background.log"
+
+# log script output also to file
+exec &> >(tee -i "$LOGPATH/stdout.log")
+
+# simplify command calls
+shopt -s expand_aliases
+ssh_opts='-o BatchMode=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o LogLevel=error -o User=sles'
+alias ssh="ssh $ssh_opts"
+alias scp="scp $ssh_opts"
+alias curl="curl -s"
+alias skuba="skuba -v5"
+export KUBECONFIG=$WORKDIR/cluster/admin.conf
+
+# ==================================================================================================
+# Functions (in $WORKDIR) & Traps
+
+cleanup() {
+    status=$?
+
+    step 'Deregister & destroy deployment'
+    [ "$(jobs -pr)" ] && { info "Killing background processes"; wait $! ||:; }
+
+    if [ -n "${TFDESTROY:-}" ]; then
+        if [ -f "$WORKDIR/terraform/terraform.tfstate" ]; then
+            if [ -n "${SCC:-}" ] || [ -n "${RMT:-}" ]; then
+                echo "Deregister machines"
+                for vm in "${IP_MASTERS[@]}" "${IP_WORKERS[@]}"; do
+                    ssh $vm sudo SUSEConnect -d >> "$LOGFILE" ||:
+                done
+            fi
+            info "Destroying deployment"
+            cd "$WORKDIR/terraform"
+            terraform destroy -auto-approve -no-color >> "$LOGFILE"
+        fi
+    else
+        [ -z "${JSON_FILE:-}" ] && warn 'Keeping deployment (-j or -k is set)'
+    fi
+
+    [ $status -eq 0 ] && step "${WORKDIR##*/} run PASSED" || error "${WORKDIR##*/} run FAILED"
+    sed -ri -e 's:\x1b\[[0-9;]*[mK]::g' -e 's:\x8+(\[.\])?::g' "$LOGPATH/stdout.log" ||:   # remove colors & non-printable chars
+    cd "$BASEDIR"
+}
+
+components() {
+    ssh "${IP_MASTERS[0]}" systemctl -q is-active crio || { echo "Not bootstrapped"; return; }
+    kubectl version --short=true | sed -r 's/(\w+) Version/Kubernetes \1/'
+
+    printf "\n# Packages: %s\n" $(zypper lr -uE | grep -i caasp_ | cut -d'|' -f 7 | tr -d ' ' ||:)
+    printf "%-10s | %s\n" skuba "$(skuba version 2>&1 | sed -n 's/^skuba version: //p')"
+    printf "%-10s | %s\n" helm $(rpm -q --qf '%{V}-%{R}' helm)
+    printf "%-10s | %s\n" sonobuoy $(sonobuoy version --short)
+    printf "%-10s | %s\n" cri-o $(ssh "${IP_MASTERS[0]}" rpm -q --qf '%{V}-%{R}' cri-o)
+    printf "%-10s | %s\n" terraform $(rpm -q --qf '%{V}-%{R}' terraform)
+
+    cri=$(ssh "${IP_MASTERS[0]}" sudo crictl images | grep -v ^IMAGE)
+    printf "\n# Containers: %s\n" $(echo "$cri" | cut -d'/' -f1 | uniq)
+    printf "%-15s | %s\n" $(echo "$cri" | sed -r 's:.*/([^ ]+) +([^ ]+).*:\1 \2:')
+
+    # repo = ssh "${IP_MASTERS[0]}" sudo zypper lr -E | grep -iE 'caasp[_-](devel|staging|release|4.0-Pool)' | cut -d' ' -f3
+    # ssh "${IP_MASTERS[0]}" zypper se -sir $repo | grep -E 'cri|kubernetes'
+    # ssh "${IP_MASTERS[0]}" zypper -s11 se -sir $repo | grep -E "^i.*(cri|kubernetes)" | awk '{print $2,$4}' | sort -k2 -u
+}
+
+trap 'cleanup' EXIT
+trap 'warn "\n  Interrupt received, cleaning up"; trap - INT; kill -s INT "$$"' INT
+trap 'error "Error line ${LINENO}: $(sed -n ${LINENO}p $BASEDIR/$0)"' ERR
+
+# ==================================================================================================
+cd "$WORKDIR" && step "= ${WORKDIR##*/} = = = = = = = = = = = = = = = = = = = = = = = = = = = = "
+# ==================================================================================================
+info "Check requirements"
+ssh-add -l &> /dev/null || { error "SSH agent empty"; exit 1; }
+test -n "$SSH_KEY"      || { error "SSH_KEY not set"; exit 1; }
+
+if [ "${INSTALL:-}" ]; then
+    info "Install / Update requirements"
+    sudo zypper -qn ref
+    sudo zypper -qn in jq kubernetes-client helm
+    # sudo zypper -qn in -t pattern SUSE-CaaSP-Management - you are responsible for skuba
+    curl https://api.github.com/repos/heptio/sonobuoy/releases/latest |\
+        jq -r '.assets[] | select(.name | contains("linux_amd64")) | .browser_download_url' |\
+        xargs curl -L |\
+        tar -xzC ~/bin sonobuoy
+fi
+zypper -q lu | grep -E 'skuba|terraform|kubectl|kubernetes-client|helm' | tr -s ' ' | column -t -s'|' -o'|' && warn "Updates are available"
+which jq skuba kubectl sonobuoy terraform helm > /dev/null || { warn "Missing requirements, run $0 -i"; exit 1; }
+
+SKUBA_BUILD=$(skuba version 2>&1 | grep '^skuba' | grep -Ewo 'development|staging|release')
+# ==================================================================================================
+if [ -z "${JSON_FILE:-}" ]; then
+    step "Setup & Deploy terraform states"
+
+    rpm -q --quiet skuba && tfpath=/usr/share/caasp/terraform/$PLATFORM || tfpath=${GOPATH:-~/go}/src/github.com/SUSE/skuba/ci/infra/$PLATFORM
+    info "Use ${tfpath}"
+    if [ -f "$tfpath/terraform.tfstate" ]; then
+        [ $(terraform state list --state="$tfpath/terraform.tfstate") ] && { error "Active tfstate found in $tfpath"; exit 1; }
+    fi
+    cp -r "$tfpath" terraform && cd terraform
+    terraform init -no-color >> "$LOGFILE"
+
+    cp terraform.tfvars.example terraform.tfvars
+    if [ "$PLATFORM" = "openstack" ]; then
+        sed -i '
+        /^image_name\b/       s/=.*/= "SLE-15-SP1-JeOS-GM"/
+        /^internal_net\b/     s/=.*/= "'"$SUFFIX"'"/
+        /^external_net\b/     s/=.*/= "floating"/
+        /^stack_name\b/       s/=.*/= "'"$SUFFIX"'"/
+        /^subnet_cidr\b/      s/=.*/= "172.28.0.0\/24"/
+        /^master_size\b/      s/=.*/= "m1.medium"/
+        /^worker_size\b/      s/=.*/= "m1.medium"/
+        /^authorized_keys\b/ {n;s|""|"'"$SSH_KEY"'"|}' terraform.tfvars
+        # example file changes a log, check sed was properly applied
+        (diff -y --suppress-common-lines "$tfpath/terraform.tfvars.example" terraform.tfvars || :) | wc -l | grep -qx 8
+    elif [ "$PLATFORM" = "vmware" ]; then
+        sed -i '
+        /^vsphere_datastore\b/     s/=.*/= "3PAR"/
+        /^vsphere_datacenter\b/    s/=.*/= "PROVO"/
+        /^vsphere_network\b/       s/=.*/= "VM Network"/
+        /^vsphere_resource_pool\b/ s/=.*/= "CaaSP_RP"/
+        /^template_name\b/         s/=.*/= "SLES15-SP1-GM-guestinfo"/
+        /^stack_name\b/            s/=.*/= "'"$SUFFIX"'"/
+        /^authorized_keys\b/ s|=.*|= ["'"$SSH_KEY"'"]|' terraform.tfvars
+        # example file changes a log, check sed was properly applied
+        (diff -y --suppress-common-lines "$tfpath/terraform.tfvars.example" terraform.tfvars || :) | wc -l | grep -qx 7
+    fi
+
+    if [ -n "${SCC:-}" ]; then
+        info "Use SCC key"
+        sed -i "/^#caasp_registry_code/ c\caasp_registry_code = \"$SCC\"" registration.auto.tfvars
+        cp registration.auto.tfvars "$LOGPATH"
+    elif [ -n "${RMT:-}" ]; then
+        info "Use RMT server"
+        sed -i "/^#rmt_server_name/ c\rmt_server_name = \"$RMT\"" registration.auto.tfvars
+        cp registration.auto.tfvars "$LOGPATH"
+    else
+        info "Use IBS repositories"
+        repos=(
+            'sle_server_pool    = "http://download.suse.de/ibs/SUSE/Products/SLE-Product-SLES/15-SP1/x86_64/product/",'
+            'basesystem_pool    = "http://download.suse.de/ibs/SUSE/Products/SLE-Module-Basesystem/15-SP1/x86_64/product/",'
+            'containers_pool    = "http://download.suse.de/ibs/SUSE/Products/SLE-Module-Containers/15-SP1/x86_64/product/",'
+            'serverapps_pool    = "http://download.suse.de/ibs/SUSE/Products/SLE-Module-Server-Applications/15-SP1/x86_64/product/",'
+            'sle_server_updates = "http://download.suse.de/ibs/SUSE/Updates/SLE-Product-SLES/15-SP1/x86_64/update/",'
+            'basesystem_updates = "http://download.suse.de/ibs/SUSE/Updates/SLE-Module-Basesystem/15-SP1/x86_64/update/",'
+            'containers_updates = "http://download.suse.de/ibs/SUSE/Updates/SLE-Module-Containers/15-SP1/x86_64/update/",'
+            'serverapps_updates = "http://download.suse.de/ibs/SUSE/Updates/SLE-Module-Server-Applications/15-SP1/x86_64/update/",')
+
+            case $SKUBA_BUILD in
+                development|staging)  # required for containers from registry.suse.de
+                    sed -i '/^packages\b/a "ca-certificates-suse",' terraform.tfvars
+                    repos+=('suse_ca = "http://download.suse.de/ibs/SUSE:/CA/SLE_15_SP1/",') ;;&
+                development)
+                    repos+=('caasp_devel = "http://download.suse.de/ibs/Devel:/CaaSP:/4.0/SLE_15_SP1/",') ;;
+                staging)
+                    repos+=('caasp_staging = "http://download.suse.de/ibs/SUSE:/SLE-15-SP1:/Update:/Products:/CASP40/staging/",') ;;
+                release)
+                    repos+=('caasp_sprint9 = "http://download.suse.de/ibs/SUSE:/Maintenance:/12065/SUSE_SLE-15-SP1_Update_Products_CASP40_Update/",')
+                    repos+=('caasp_release = "http://download.suse.de/ibs/SUSE:/SLE-15-SP1:/Update:/Products:/CASP40/standard/",')
+                    repos+=('caasp_update = "http://download.suse.de/ibs/SUSE:/SLE-15-SP1:/Update:/Products:/CASP40:/Update/standard/",') ;;
+            esac
+
+            sed -i '/^repositories\b/ s|=.*|= {\n '"${repos[*]/,/,\\n}"'}|' terraform.tfvars
+    fi
+    cp terraform.tfvars "$LOGPATH"
+
+    # Add grow deployment test
+    if [[ "$TESTSUITE" =~ base ]]; then
+        if [ "$MASTER_COUNT" -ne 1 ] || [ "$WORKER_COUNT" -ne 1 ]; then
+            sed -i '
+            /^masters\b/ s/=.*/= 1/
+            /^workers\b/ s/=.*/= 1/' terraform.tfvars
+            terraform apply -auto-approve -no-color >> "$LOGFILE" &
+            spinner "Apply terraform 1:1"
+        fi
+    fi
+
+    sed -i '
+    /^masters\b/ s/=.*/= '"$MASTER_COUNT"'/
+    /^workers\b/ s/=.*/= '"$WORKER_COUNT"'/' terraform.tfvars
+    cp terraform.tfvars "$LOGPATH"
+    terraform apply -auto-approve -no-color >> "$LOGFILE" &
+    spinner "Apply terraform $MASTER_COUNT:$WORKER_COUNT"
+
+    info "Check cloud-init status"
+    for vm in $(terraform output -json | jq '.ip_masters.value[0],.ip_workers.value[0]' -r); do
+        # Wait for reboot when terraform finished
+        for i in {1..10}; do
+            [ $i -ne 1 ] && sleep 10
+            ssh -q $vm exit && break
+        done
+        scp $vm:/var/log/cloud-init.log "$LOGPATH/$vm-cloud-init.log"
+        scp $vm:/var/log/cloud-init-output.log "$LOGPATH/$vm-cloud-init-output.log"
+        ssh $vm cloud-init status | grep 'status: done' > /dev/null
+    done
+fi
+
+# ==================================================================================================
+step 'Parse cluster IPs'
+
+[ -n "${JSON_FILE:-}" ] && JSON=$(cat "$JSON_FILE") || JSON=$(terraform output --json)
+echo "$JSON" >> "$LOGFILE"
+
+IP_LB=$(jq '.ip_load_balancer.value // empty' -c <<< "$JSON" | tr -d '[]"')
+readarray -t IP_MASTERS < <(jq '.ip_masters.value[]' -r <<< "$JSON")
+readarray -t IP_WORKERS < <(jq '.ip_workers.value[]' -r <<< "$JSON")
+info "LB: ${IP_LB:-master[0]}"
+info "Masters: ${IP_MASTERS[*]}"
+info "Workers: ${IP_WORKERS[*]}"
+
+# ==================================================================================================
+cd "$WORKDIR"
+if [[ "$TESTSUITE" =~ join ]]; then
+    step 'Bootstrap cluster & join nodes'
+
+    info "skuba init"
+    skuba cluster init --control-plane "${IP_LB:-${IP_MASTERS[0]}}" cluster >> "$LOGFILE" && cd cluster
+    tail -1 "$LOGFILE" | grep -q "configuration files written"
+
+    info "skuba bootstrap"
+    skuba node bootstrap --user sles --sudo --target "${IP_MASTERS[0]}" master-0 &>> "$LOGFILE"
+    tail -1 "$LOGFILE" | grep -q "successfully bootstrapped node"
+
+    for ((i=0; i<${#IP_WORKERS[@]}; i++)); do
+        info "skuba join worker-$i"
+        skuba node join -s -u sles -t "${IP_WORKERS[$i]}" -r worker worker-$i &>> "$LOGFILE"
+        tail -1 "$LOGFILE" | grep -q "successfully joined the cluster"
+    done
+
+    for ((i=1; i<${#IP_MASTERS[@]}; i++)); do
+        info "skuba join master-$i"
+        skuba node join -s -u sles -t "${IP_MASTERS[$i]}" -r master master-$i &>> "$LOGFILE"
+        tail -1 "$LOGFILE" | grep -q "successfully joined the cluster"
+    done
+
+    # Check all nodes are in
+    info "wait for nodes"
+    kubectl wait --for=condition=ready nodes --all --timeout=5m >> "$LOGFILE"
+    kubectl get nodes | grep -c ^worker | grep -qx ${#IP_WORKERS[@]}
+    kubectl get nodes | grep -c ^master | grep -qx ${#IP_MASTERS[@]}
+    skuba cluster status | grep -c ^worker | grep -qx ${#IP_WORKERS[@]}
+    skuba cluster status | grep -c ^master | grep -qx ${#IP_MASTERS[@]}
+fi
+
+components > "$LOGPATH/components.log"
+
+if [[ "$TESTSUITE" =~ base ]]; then
+    step "Run base cluster tests"
+    if [ ${#IP_WORKERS[@]} -gt 1 ]; then
+        nodename='worker-1'
+        info "skuba remove & reset & join $nodename"
+        skuba node remove $nodename &>> "$LOGFILE"
+        tail -1 "$LOGFILE" | grep -q "successfully removed from the cluster"
+        grep -q "caasp-kubelet-disarm-$nodename executed successfully" "$LOGFILE" || error "Failed to disarm $nodename, bsc#1138908"
+        kubectl get nodes/$nodename 2>> "$LOGFILE" && { error 'Node still present in cluster'; exit 1; }
+
+        skuba node reset -s -u sles -t ${IP_WORKERS[1]} &>> "$LOGFILE"
+        tail -1 "$LOGFILE" | grep -q "successfully reset node"
+        ssh "${IP_WORKERS[1]}" sudo systemctl unmask kubelet &>> "$LOGFILE"
+
+        skuba node join -s -u sles -t ${IP_WORKERS[1]} -r worker $nodename &>> "$LOGFILE"
+        tail -1 "$LOGFILE" | grep -q "successfully joined the cluster"
+        kubectl get nodes/$nodename >> "$LOGFILE"
+
+        info "skuba remove offline $nodename"
+        ssh "${IP_WORKERS[1]}" sudo poweroff 2>> "$LOGFILE" ||:
+        skuba node remove $nodename &>> "$LOGFILE"
+        tail -1 "$LOGFILE" | grep -q "successfully removed from the cluster"
+        kubectl get nodes/$nodename 2>> "$LOGFILE" && { error 'Node still present in cluster'; exit 1; }
+    fi
+
+    if [ ${#IP_MASTERS[@]} -gt 1 ]; then
+        nodename='master-1'
+        info "skuba remove & reset $nodename" # & join
+        skuba node remove $nodename &>> "$LOGFILE"
+        tail -1 "$LOGFILE" | grep -q "successfully removed from the cluster"
+        grep -q "caasp-kubelet-disarm-$nodename executed successfully" "$LOGFILE" || error "Failed to disarm $nodename, bsc#1138908"
+        kubectl get nodes/$nodename 2>> "$LOGFILE" && { error 'Node still present in cluster'; exit 1; }
+
+        # skuba node reset -s -u sles -t ${IP_MASTERS[1]} &>> "$LOGFILE"
+        # tail -1 "$LOGFILE" | grep -q "successfully reset node"
+        # ssh "${IP_MASTERS[1]}" sudo systemctl unmask kubelet &>> "$LOGFILE"
+
+        # [ERROR Port-10251]: Port 10251 is in use
+        # skuba node join -s -u sles -t ${IP_MASTERS[1]} -r master $nodename &>> "$LOGFILE"
+        # tail -1 "$LOGFILE" | grep -q "successfully joined the cluster"
+        # kubectl get nodes/$nodename >> "$LOGFILE"
+
+        # info "skuba remove offline master"
+        # ssh "${IP_MASTERS[1]}" sudo poweroff 2>> "$LOGFILE" ||:
+        # skuba node remove $nodename &>> "$LOGFILE"
+        # tail -1 "$LOGFILE" | grep -q "successfully removed from the cluster"
+    fi
+
+    info "wait for pods"
+    # kubectl wait --for=condition=ready pods --all -n kube-system --timeout=5m >> "$LOGFILE" # FREEZES: cilium restarts?
+    for i in {1..10}; do
+        [ -z "$(kubectl get pods -n kube-system | grep -vw Completed | grep "0/\|1/2\|No resources")" ] && break
+        [ $i -ne 10 ] && sleep 10 || false
+    done
+
+    . "$BASEDIR/vc_tests/nginx.sh"
+#    . "$BASEDIR/vc_tests/cilium.sh"
+    . "$BASEDIR/vc_tests/ldap.sh"
+    . "$BASEDIR/vc_tests/bugs.sh"
+    . "$BASEDIR/vc_tests/supportconfig.sh"
+    # . "$BASEDIR/vc_tests/reboot.sh"
+
+    { kubectl get nodes -o wide
+        kubectl get pods --all-namespaces
+        skuba cluster status
+    } &>> "$LOGFILE"
+fi
+
+if [[ "$TESTSUITE" =~ sono ]]; then
+    cd "$WORKDIR"
+    . "$BASEDIR/vc_tests/sonobuoy.sh"
+fi

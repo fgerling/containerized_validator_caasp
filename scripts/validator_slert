@@ -1,0 +1,356 @@
+#!/usr/bin/env bash
+# TODO: checking kernel log before and after test
+# -i	Install test suite
+# -d	dbench
+# -r	reaim - 15m
+# -l	ltp - 5h
+# -m	memeat - 5m
+# -n	newburn - 36h
+# -s	netperf server 10.100.103.155 - 45m
+# -u	report user for QADB
+
+set -uo pipefail
+
+RUNNER="/usr/lib/ctcs2/tools/run"
+
+# Log to a file
+exec > >(tee -i logfile)
+exec 2>&1
+
+trap control_c SIGINT SIGTERM
+control_c() {
+  echo -en "\n*** Ouch! Exiting ***\n"
+  PGID=$(ps -o pgid=$$ | grep -o [0-9]*)
+  setsid kill -- -$PGID
+  exit 0
+}
+
+usage() {
+	echo "Usage: $0 [-i] [-drlmn] [-s 10.100.103.155] [-e mkravec@suse.com] [-u mkravec]"
+	exit 1
+}
+
+while getopts "idrlmns:e:u:" opt; do
+case $opt in
+	i)	INSTALL=true
+		;;
+	d)	DBENCH=true
+		;;
+	r)	REAIM=true
+		;;
+	l)	LTP=true
+		;;
+	m)	MEMEAT=true
+		;;
+	n)	NEWBURN=true
+		;;
+	s)  NETSERVER=$OPTARG
+		;;
+	e)	EMAIL=$OPTARG
+		;;
+	u)	REPORTER=$OPTARG
+		;;
+	\?) usage
+		;;
+	:)
+		echo "Option -$opt requires an argument." >&2
+		usage
+		;;
+esac
+done
+
+# Helpers
+######################################################
+counter=0
+
+red() { echo -e "\033[0;31m$1\033[0m"; }
+green() { echo -e "\033[0;32m$1\033[0m"; }
+yellow() { echo -e "\033[0;33m$1\033[0m"; }
+
+# with counter -c
+pindent() {
+	[ $counter -lt 10 ] && echo -n ' '
+	if [[ ${1-} =~ 'c' ]]; then
+		echo -n "$counter: "
+	else
+		echo -n "$counter" | tr [:digit:] ' '
+		echo -n ": "
+	fi
+}
+
+pspacer() {
+	local size=${#1}
+	local spacer=''
+	while [ $size -lt 50 ]; do
+		spacer="${spacer}."
+		let size++
+	done
+	echo -n "${1}$spacer"
+}
+
+# -s sub -m multi line
+ptry() {
+	if [[ ${2-} =~ 's' ]]; then
+		pindent
+		pspacer "$1"
+	else
+		let counter++
+		pindent -c
+		[[ ${2-} =~ 'm' ]] && echo "$1" || pspacer "$1"
+	fi
+}
+
+# silent -q exit -x
+pcheck() {
+	[[ ${2-} =~ 'q' ]] && pindent
+	case $1 in
+		0)
+			green "OK"
+			;;
+		-1)
+			yellow 'SKIP'
+			;;
+		*)
+			red 'FAIL'
+			if [[ ${2-} =~ 'x' ]]; then
+				echo
+				pindent; echo "################################"
+				pindent; red  "# Script exited by failed test #"
+				pindent; echo "################################"
+				exit $1
+			fi
+			;;
+	esac
+}
+
+pcheck_log() {
+	local pr=$(sed -r "s:\x1B\[[0-9;]*[mK]::g" $1 | grep 'FAILED ')
+	local pc=$(echo "$pr" | grep -v "^$" | wc -l)
+
+	ptry "Found $pc problems" -s; pcheck $pc
+	if [ $pc -ne 0 ]; then
+		while read line; do
+			pindent
+			echo "$line"
+		done <<< "$pr"
+	fi
+}
+
+ptry "Running in screen"
+[ ! -z "${STY:-}" ]; pcheck $? -x
+
+ptry "Set date from ntp"
+ntpdate -s time.nist.gov; pcheck $?
+
+# Add repositories
+######################################################
+if [ ! -z "${INSTALL:-}" ]; then
+	ptry "Preparing system" -m
+	ptry "Adding repositorits" -s
+	zypper lr 'QA_Head' &>/dev/null || zypper -q ar http://download.suse.de/ibs/QA:/Head/SLE-12-SP1/QA:Head.repo
+	zypper lr 'Devel_RTE_SLE12SP1' &>/dev/null || zypper -q ar http://download.suse.de/ibs/Devel:/RTE:/SLE12SP1/standard/Devel:RTE:SLE12SP1.repo
+	zypper lr QA_Head Devel_RTE_SLE12SP1 &>/dev/null; pcheck $? -x
+
+	ptry "Installing test suites" -s
+	zypper -q --gpg-auto-import-keys refresh
+	zypper -q --non-interactive install \
+		qa_tools \
+	    preempt-test \
+	    qa_test_newburn \
+	    qa_test_reaim \
+	    qa_test_ltp \
+	    qa_test_memeat \
+	    qa_test_dbench \
+	    qa_test_netperf \
+	    rt-tests > /dev/null
+		#? qa_test_dbench-4_0 \
+	pcheck $? -x
+fi
+
+# Short tests (QA)
+######################################################
+ptry "Running RT kernel"
+rta=$(uname -v | grep -o 'PREEMPT RT')
+rtb=$(cat /sys/kernel/realtime)
+[ -n "$rta" -a $rtb -eq 1 ]; pcheck $? -x
+
+PKGS="babeltrace-devel lttng-tools-devel kernel-compute-devel kernel-compute_debug-devel kernel-rt-devel kernel-rt_debug-devel kernel-devel-rt libcpuset-devel"
+ptry "Devel packages available in repo (FATE #316652)" -m
+for pkg in $PKGS; do
+	ptry "$pkg" -s
+	zypper -q search -r RT "$pkg" > /dev/null; pcheck $?
+done
+
+ptry "SocketCAN driver  (FATE #317131)" -m
+ptry "modprobe" -s
+modprobe peak_pci; pcheck $?
+ptry "lsmod" -s
+lsmod | grep -o peak_pci >/dev/null; pcheck $?
+
+ptry "Preempt test"
+fail=$(preempt-test | grep 'Test PASSED')
+[ "$fail" == 'Test PASSED' ]; pcheck $?
+
+
+# CTCS2 tests
+######################################################
+ptry "ctcs2: Running ctcs tests" -m
+
+if [ ! -z "${NETSERVER:-}" ]; then
+	ptry "Check netserver connection" -s
+	nc -z "$NETSERVER" 12865; pcheck $? -x
+
+	ptry "Setup netserver config" -s
+	sed -i -e "/^CZ=/ s/'.*'/'${NETSERVER%.*.*}'/" -e "/CZ_netperf_server/ s/=.*/=$NETSERVER/" /usr/lib/ctcs2/config/netperf/qa_test_netperf-config
+	pcheck $? -x
+
+	ptry "Running netperf" -s
+	logger "ctcs2: Running netperf"
+	/usr/share/qa/tools/test_netperf-run > netperf.log; pcheck $?
+else
+	ptry "Running netperf" -s; pcheck -1
+fi
+
+ptry "Running memeat" -s
+if [ ! -z "${MEMEAT:-}" ]; then
+	logger "ctcs2: Running memeat"
+	/usr/share/qa/tools/test_memeat-run > memeat.log; pcheck $?
+else
+	pcheck -1
+fi
+
+ptry "Running dbench" -s
+if [ ! -z "${DBENCH:-}" ]; then
+	logger "ctcs2: Running dbench"
+	#/usr/share/qa/tools/test_dbench-run > dbench.log; pcheck $?
+	/usr/share/qa/tools/test_dbench-4_0_async-run
+else
+	pcheck -1
+fi
+
+ptry "Running reaim" -s
+if [ ! -z "${REAIM:-}" ]; then
+	logger "ctcs2: Running reaim"
+	$RUNNER /usr/lib/ctcs2/tcf/reaim.tcf > reaim.log; pcheck $?
+else
+	pcheck -1;
+fi
+
+ptry "Running LTP" -s
+if [ ! -z "${LTP:-}" ]; then
+	logger "ctcs2: Running LTP"
+	/usr/lib/ctcs2/tools/test_ltp-run > ltp.log; pcheck $?
+else
+	pcheck -1
+fi
+
+ptry "Running newburn" -s
+if [ ! -z "${NEWBURN:-}" ]; then
+	logger "ctcs2: Running newburn"
+	/usr/lib/ctcs2/tools/test_newburn-run > newburn.log; pcheck $?
+else
+	pcheck -1
+fi
+
+logger "ctcs2: Done."
+
+# Finish
+######################################################
+ptry "Finishing" -m
+ptry "Report results to QADB" -s
+if [ ! -z "${REPORTER:-}" ]; then
+	pcheck 1
+	#/usr/share/qa/tools/remote_qa_db_report.pl -R -p SLERT-12-SP1-beta3 -T $REPORTER
+	#/usr/share/qa/tools/remote_qa_db_report.pl -R -p SLERT-12-SP1-RC1 -T mkravec
+	#/usr/share/qa/tools/remote_qa_db_report.pl -R -p SLERT-11-SP4-GM -T mkravec
+else
+	pcheck -1
+fi
+
+ptry "Sending kernel logs"; pcheck -1
+
+ptry "Sending mails"
+if [ ! -z "${EMAIL:-}" ]; then
+	#sed -r "s:\x1B\[[0-9;]*[mK]::g" memeat.log | mail -s "memeat" mkravec@suse.com
+	echo "RT tests finished." | mail -s "RT tests finished" "$EMAIL"
+	pcheck $?
+else
+	pcheck -1
+fi
+
+
+echo
+echo 'Done.'
+echo
+exit 0
+
+ptry "Irqbalance"
+irqbalance; pcheck $?
+
+
+#sed -r "s:\x1B\[[0-9;]*[mK]::g" ltpout | grep 'Test run was interrupted'
+#sed -r "s:\x1B\[[0-9;]*[mK]::g" ltpout | grep 'Test run completed with errors'
+#sed -r "s:\x1B\[[0-9;]*[mK]::g" ltpout | grep 'Test run completed successfully'
+# qa_test_dbench ? qa_test_dbench-4_0
+
+######################################################
+ptry "RT tests" -m
+
+#cyclictest_plot.sh
+#cyclictest_run.sh
+ptry "cyclictest" -s; pcheck -1
+# cyclictest -l1000
+
+# socket performance
+ptry "hackbench" -s; pcheck -1
+#hackbench
+
+ptry "pi_stress" -s; pcheck -1
+#pi_stress --duration=15
+
+# Try to invoke priority inversion
+ptry "pip_stress" -s
+pass=$(pip_stress | grep 'Successfully used priority inheritance to handle an inversion')
+[ -n "$pass" ]; pcheck $?
+
+# Message queue latency
+ptry "pmqtest" -s; pcheck -1
+#pmqtest -l 1000
+
+# Threads mutex latency
+ptry "ptsematest" -s; pcheck -1
+#ptsematest -l 10000
+
+ptry "rt-migrate-test" -s
+pass=$(rt-migrate-test -c 2>&1 | grep 'Passed')
+[ -n "$pass" ]; pcheck $?
+
+# signal roundtrip test
+ptry "signaltest" -s; pcheck -1
+# signaltest -l 1000
+
+# sigwait latency
+ptry "sigwaittest" -s; pcheck -1
+#sigwaittest -l 1000
+
+# semaphore latency
+ptry "svsematest" -s; pcheck -1
+#svsematest -l 1000
+
+
+# ----------------------------------------------------
+# before test
+#journalctl --dmesg --no-pager -p err > logbf
+#journalctl --dmesg --no-pager -p err > logaf
+#diff logbf logaf
+
+
+#exec >  >(tee -a foo.log)
+#exec 2> >(tee -a foo.log >&2)
+
+echo
+echo 'Done.'
+
+#sed -r "s:\x1B\[[0-9;]*[mK]::g" logfile | mail -s "RT testing done" mkravec@suse.com
+
+exit 0

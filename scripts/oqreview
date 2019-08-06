@@ -1,0 +1,25 @@
+#!/bin/bash
+
+# Wrapper for openqa-review script which
+# - updates the script
+# - generates review
+# - opens in editor
+
+[ "$#" -ge  1 ] && BUILD="-B $1"
+[ "$#" -ge  2 ] && BUILD_HA="-B $2"
+
+PARAMS="--no-empty-sections --query-issue-status -T --running-threshold 50 --include-softfails "
+
+
+# update review script
+cd /home/kravciak/git/openqa-review
+git pull
+sudo pip install -r requirements.txt
+sudo pip install .
+
+# generate review
+cd /home/kravciak/Documents/review
+[ -n "$BUILD" ] && openqa-review $PARAMS -J https://openqa.suse.de/group_overview/55 $BUILD > review-sles
+[ -n "$BUILD_HA" ] && openqa-review $PARAMS -J https://openqa.suse.de/group_overview/64 $BUILD_HA > review-ha
+
+sublime review-sles review-ha

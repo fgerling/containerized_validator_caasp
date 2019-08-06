@@ -1,0 +1,656 @@
+#!/usr/bin/env bash
+#2>&1 #!/usr/bin/env bash
+#
+# Parameters
+# -r register (for sles)
+# -i installation size
+# -d device for filesystem testing
+#   -t fs types for -d option (btrfs,ext3,ext4,xfs)
+# -l locale
+# -k keyboard
+# -s rsync remote testing host (needs sshd)
+# -v verbose (show problems in logs)
+
+source /etc/os-release
+
+set -o nounset
+set -o noclobber
+
+if [ "$EUID" -ne 0 ]; then
+    echo "Please run as root"
+    exit
+fi
+
+SCC_USER='scc-internal@suse.de'
+SCC_PASS='32d819432ec25499'
+VERBOSE=false
+INST_SIZE=1200
+MOUNT='/mnt/testfs'
+FSS='btrfs,ext3,ext4,xfs'
+MOUNT_LABEL='Test disk'
+LOG='jeos_validator.log'
+TIMESTAMP=$(date +%s)
+
+[ -f $LOG ] && rm $LOG
+
+usage() {
+	echo "Usage: $0 [-v] [-i 650] [-d /dev/sdb1] [-t 'btrfs,ext3,ext4,xfs'] -l en_US.UTF-8 -k 'us' -z 'UTC' [-s 'kravciak@dhcp155.qa']" 1>&2
+	exit 1
+}
+
+while getopts "i:d:t:s:l:k:z:v" opt; do
+case $opt in
+	s)
+		RSYNC_HOST=$OPTARG
+		;;
+	l)
+		LOCALE=$OPTARG
+		;;
+	t)
+		FSS=$OPTARG
+		;;
+	d)
+		DEVICE=$OPTARG
+		;;
+	k)
+		KEYMAP=$OPTARG
+		;;
+	z)
+		TIMEZONE=$OPTARG
+		;;
+	i)
+		INST_SIZE=$OPTARG
+		;;
+	v)
+		VERBOSE=true
+		;;
+	\?)
+		usage
+		;;
+	:)
+		echo "Option -$opt requires an argument." >&2
+		usage
+		;;
+esac
+done
+
+[ -z "${LOCALE:-}" ] && usage
+[ -z "${KEYMAP:-}" ] && usage
+[ -z "${TIMEZONE:-}" ] && usage
+
+######################################################
+
+counter=0
+
+# Regular Colors
+#Black='\033[0;30m'        # Black
+#Blue='\033[0;34m'         # Blue
+#Purple='\033[0;35m'       # Purple
+#Cyan='\033[0;36m'         # Cyan
+#White='\033[0;37m'        # White
+
+red() { echo -e "\033[0;31m$1\033[0m"; }
+green() { echo -e "\033[0;32m$1\033[0m"; }
+yellow() { echo -e "\033[0;33m$1\033[0m"; }
+
+# with counter -c
+pindent() {
+	[ $counter -lt 10 ] && echo -n ' '
+	if [[ ${1-} =~ 'c' ]]; then
+		echo -n "$counter: "
+	else
+		echo -n "$counter" | tr [:digit:] ' '
+		echo -n ": "
+	fi
+}
+
+pspacer() {
+	local size=${#1}
+	local spacer=''
+	while [ $size -lt 50 ]; do
+		spacer="${spacer}."
+		let size++
+	done
+	echo -n "${1}$spacer"
+}
+
+# -s sub -m multi line
+ptry() {
+	# put a fat banner to the log so the file is better structured
+	echo -e "\n\n[[[ $1 ]]]" >> $LOG
+	if [[ ${2-} =~ 's' ]]; then
+		pindent
+		pspacer "$1"
+	else
+		let counter++
+		pindent -c
+		[[ ${2-} =~ 'm' ]] && echo "$1" || pspacer "$1"
+	fi
+}
+
+# silent -q exit -x
+TOK=0
+TSKIP=0
+TFAIL=0
+pcheck() {
+	[[ ${2-} =~ 'q' ]] && pindent
+	case $1 in
+		0)
+			green ' OK'; ((TOK++))
+			;;
+		-1)
+			yellow ' SKIP'; ((TSKIP++))
+			;;
+		*)
+			red ' FAIL'; ((TFAIL++))
+			if [[ ${2-} =~ 'x' ]]; then
+				echo
+				pindent; echo "################################"
+				pindent; red  "# Script exited by failed test #"
+				pindent; echo "################################"
+				exit $1
+			fi
+			;;
+	esac
+}
+
+isopenstack() {
+    dmesg | grep OpenStack >> $LOG; return $?
+}
+
+######################################################
+# Base
+
+ptry "GPT Partition Table"
+part=$(findmnt / | sed 1d | tr '/[[:digit:]' ' ' | awk '{ print $2 }')
+gpt=$(parted -mls 2>&1 | tee -a $LOG | grep ^/dev/$part | cut -d':' -f6)
+if [ "$gpt" == 'gpt' ]; then
+	# all but Xen PV guest
+	pcheck 0
+elif [ "$gpt" == 'msdos' ] && uname -r | grep "^[0-9.-]*-xen" >> $LOG; then
+	# Xen PV guest; SKIP as PRD say all images should use GPT but
+	# Xen PV guest can't as it does not use (U)EFI → BIOS & MBR
+	pcheck -1
+else
+	# error
+	pcheck 1
+fi
+
+ptry "kernel-default-base is the default"
+rpmquery kernel-default-base | grep kernel-default-base-$(uname -r | sed 's/-.*//') >> $LOG; pcheck $?
+
+ptry "Filesystem mounted by label"
+if isopenstack; then
+    label="$(mount --show-labels | grep ' / ' | awk '{ print $7 }' | tr -d '[]')"
+else
+    label="$(btrfs filesystem show / | grep -o 'Label: .*' | awk '{ print $2 }' | tr -d \')"
+fi
+[ "$label" == "ROOT" ]; pcheck $?
+
+ptry "Installation size < $INST_SIZE MiB"
+if isopenstack; then
+    fs_size="$(($(du -c / --exclude={/root,/home,/tmp,/var/tmp,/proc,/sys} 2>/dev/null | grep 'total$' | awk '{ print $1 }')*1024))"
+else
+    fs_size="$(btrfs filesystem df -b / | tee -a $LOG | grep Data | sed -n 's/^.*used=//p')"
+fi
+echo fs_size=$fs_size >> $LOG
+[ "$fs_size" -lt $(($INST_SIZE*1024*1024)) ]; pcheck $?
+
+if ! isopenstack; then
+    ptry "24 GiB root filesystem"
+    size=$(df --output=size -BG / | tee -a $LOG | sed 1d | tr -d ' ')
+    [ "$size" == '24G' ]; pcheck $?
+fi
+
+# Firewall
+if ! isopenstack; then
+    ptry "Firewall" -m
+    ptry "Active" -s
+    firewall=firewalld
+    expectedstate=active
+    if [ $VERSION = "12-SP5" ]; then firewall=SuSEfirewall2; expectedstate=exited; fi
+    if [ $VERSION = "15-SP1" ]; then expectedstate=running; fi
+    state=$(systemctl show --no-pager $firewall | tee -a $LOG | grep ActiveState | cut -d'=' -f2)
+    [ "$state" == "active" ]; pcheck $?
+    ptry "Running" -s
+    state=$(systemctl show --no-pager $firewall | tee -a $LOG | grep SubState | cut -d'=' -f2)
+    [ "$state" == "$expectedstate" ]; pcheck $?
+    ptry "Made iptables rules" -s
+    rules=$(iptables --list | tee -a $LOG | wc -l)
+    [ "$rules" -gt 30 ]; pcheck $?
+fi
+
+# SSH
+ptry "SSH" -m
+ptry "Access enabled - active" -s
+state=$(systemctl show --no-pager sshd | tee -a $LOG | grep ActiveState | cut -d'=' -f2)
+[ "$state" == "active" ]; pcheck $?
+ptry "Access enabled - running" -s
+state=$(systemctl show --no-pager sshd | tee -a $LOG | grep SubState | cut -d'=' -f2)
+[ "$state" == "running" ]; pcheck $?
+
+if ! isopenstack; then
+    ptry "Port 22 is open" -s
+    iptables --list | tee -a $LOG | grep -q 'ACCEPT.*tcp.*anywhere.*anywhere.*tcp dpt:ssh'; pcheck $?
+fi
+
+ptry "Kdump disabled"
+if [ -r /sys/kernel/kexec_crash_loaded ]; then
+	kdump=$(cat /sys/kernel/kexec_crash_loaded | tee -a $LOG)
+	[ $kdump == "0" ]; pcheck $?
+else
+	# /sys/kernel/kexec_crash_loaded is not present on Xen para virt guest
+	pcheck -1
+fi
+
+
+######################################################
+# Locale & KeyTable & Timezone
+
+ptry "Locale checks" -m
+getent passwd kravciak >/dev/null
+if [ "$?" -eq 2 ]; then
+	ptry "Adding user account" -s
+	useradd -m kravciak 2>&1 >>$LOG; pcheck $?
+fi
+
+ptry "User locale" -s
+oksum=0
+lc=$(su -c 'locale' - kravciak | tee -a $LOG | grep "^LANG=$LOCALE$" | wc -l)
+[ "$lc" -eq 1 ] || ((oksum++))
+lc=$(su -c 'locale' - kravciak | grep "^LC_ALL=$" | wc -l)
+[ "$lc" -eq 1 ] || ((oksum++))
+lc=$(su -c 'locale' - kravciak | egrep "^LC_[[:upper:]]+=\"*$LOCALE\"*$" | wc -l)
+[ "$lc" -eq 12 ] || [ "$lc" -eq 13 ] || ((oksum++))
+pcheck $oksum
+
+ptry "Root locale" -s
+oksum=0
+lc=$(su -c 'locale' - | tee -a $LOG | grep "^LANG=POSIX$" | wc -l)
+[ "$lc" -eq 1 ] || ((oksum++))
+lc=$(su -c 'locale' - | grep "^LC_ALL=$" | wc -l)
+[ "$lc" -eq 1 ] || ((oksum++))
+lc=$(su -c 'locale' - | egrep "^LC_[[:upper:]]+=\"POSIX\"$" | wc -l)
+[ "$lc" -eq 11 ] || ((oksum++))
+lc=$(su -c 'locale' - | egrep "^LC_CTYPE=$LOCALE$" | wc -l)
+[ "$lc" -eq 1 ] || ((oksum++))
+pcheck $oksum
+
+
+ptry "Keymap" -s
+map=$(grep ^KEYMAP /etc/vconsole.conf | tee -a $LOG | cut -d'"' -f2)
+[ "$map" == "KEYMAP=$KEYMAP" ]; pcheck $?
+
+ptry "Timezone" -s
+tz=$(LC_ALL=C ls -l /etc/localtime 2> /dev/null | awk '{ print $11 }' | sed 's|^.*/usr/share/zoneinfo/||' | tee -a $LOG)
+[ "$tz" == "$TIMEZONE" ]; pcheck $?
+
+
+######################################################
+# Packages
+
+family=all
+if [ $VERSION = "12-SP5" ]; then family=Server; fi
+ptry 'Package management' -m
+if SUSEConnect --status-text | grep "Not Registered" >> $LOG; then
+	ptry "Register system at SCC" -s
+	SUSEConnect -e "$SCC_USER" -r "$SCC_PASS" --url http://$family-0000.proxy.scc.suse.de >> $LOG 2>&1
+	pcheck $?
+fi
+ptry 'Repositories refreshed' -s
+zypper ref >> $LOG; pcheck $? -x
+
+ptry 'Repositories defined' -s
+zypper lr >> $LOG; pcheck $? -x
+
+ptry 'Install updates' -s
+zypper --non-interactive update --auto-agree-with-licenses >> $LOG
+pcheck $?
+
+if [ $VERSION == "12-SP5" ]; then
+  ptry "Activate product 'Toolchain Module'" -s
+  SUSEConnect -p sle-module-toolchain/12/$(uname -i) >> $LOG >> $LOG 2>&1
+  pcheck $?
+
+  ptry "Install package from 'Toolchain Module' product" -s
+  zypper --non-interactive install pattern:gcc5 >> $LOG
+  pcheck $?
+fi
+
+ptry "Install qemu-tools" -s
+zypper --non-interactive install qemu-tools >> $LOG
+pcheck $?
+
+ptry "qemu-tools installed" -s
+qemu-img --version >> $LOG
+pcheck $?
+
+######################################################
+# Filesystems
+
+if [ ! -z "${DEVICE:-}" ]; then
+	[ -b "$DEVICE" ] || { echo "Device $DEVICE missing"; exit; }
+
+        grep -q $DEVICE /proc/mounts 2>&1 >> $LOG && umount $DEVICE
+	mkdir -p $MOUNT
+	rm -f ${MOUNT}/*
+	check_mount() {
+                sleep 10	# so label is found
+		local fs=$1
+		local count=-1
+
+		ptry 'Mount filesystem' -s
+		mount -t "$fs" -L "${MOUNT_LABEL}" $MOUNT; pcheck $?
+
+		ptry 'Check if mounted again' -s
+		grep "$DEVICE $MOUNT $fs" /proc/mounts >> $LOG; pcheck $?
+
+		ptry 'Create and count files' -s
+		touch "$MOUNT/file"{1..100}
+		count=$(ls $MOUNT --ignore='lost+found' | tee -a $LOG | wc -l);
+		[ $count -eq 100 ]; pcheck $?
+		
+		ptry 'Umount and count files' -s
+		umount "$MOUNT"
+		count=$(ls $MOUNT | tee -a $LOG | wc -l)
+		[ $count -eq 0 ]; pcheck $?
+	}
+
+	if [[ "$FSS" =~ 'btrfs' ]]; then
+		ptry 'Check btrfs filesystem' -m
+		rpmquery btrfsprogs >> $LOG || zypper --non-interactive install btrfsprogs >> $LOG
+
+		ptry "Filesystem installed" -s
+		hash 'mkfs.btrfs' 2>/dev/null; pcheck $? -x
+
+		ptry 'Create filesystem' -s
+		mkfs.btrfs -f -L "$MOUNT_LABEL" $DEVICE >> $LOG 2>&1; pcheck $?
+		check_mount 'btrfs'
+	fi
+
+	if [[ "$FSS" =~ 'ext3' ]]; then
+		ptry 'Check ext3 filesystem' -m
+		rpmquery e2fsprogs >> $LOG || zypper --non-interactive install e2fsprogs >> $LOG
+
+		ptry "Filesystem installed" -s
+		hash 'mkfs.ext3' 2>/dev/null; pcheck $? -x
+
+		ptry 'Create filesystem' -s
+		# -E nodiscard on XEN
+		#	mkfs.ext3 -E nodiscard -q -F -L "$MOUNT_LABEL" $DEVICE >> $LOG; pcheck -1
+		mkfs.ext3 -F -L "$MOUNT_LABEL" $DEVICE >> $LOG 2>&1; pcheck $?
+		check_mount 'ext3'
+	fi
+
+	if [[ "$FSS" =~ 'ext4' ]]; then
+		ptry 'Check ext4 filesystem' -m
+		rpmquery e2fsprogs >> $LOG || zypper --non-interactive install e2fsprogs >> $LOG
+
+		ptry "Filesystem installed" -s
+		hash 'mkfs.ext4' 2>/dev/null; pcheck $? -x
+
+		ptry 'Create filesystem' -s
+		mkfs.ext4 -F -L "$MOUNT_LABEL" $DEVICE >> $LOG 2>&1; pcheck $?
+		check_mount 'ext4'
+	fi
+
+	if [[ "$FSS" =~ 'xfs' ]]; then
+		ptry 'Check xfs filesystem' -m
+		rpmquery xfsprogs >> $LOG || zypper --non-interactive install xfsprogs >> $LOG
+
+		ptry "Filesystem installed" -s
+		hash 'mkfs.xfs' 2>/dev/null; pcheck $? -x
+
+		ptry 'Create filesystem' -s
+		mkfs.xfs -f -L "$MOUNT_LABEL" $DEVICE >> $LOG 2>&1; pcheck $?
+		check_mount 'xfs'
+	fi
+fi
+######################################################
+# Rsync
+
+rdir="/tmp/dir-$TIMESTAMP"
+dir1="/tmp/dir1-$TIMESTAMP"
+dir2="/tmp/dir2-$TIMESTAMP"
+dir3="/tmp/dir3-$TIMESTAMP"
+
+# Local rsync test
+ptry "Local rsync test - $TIMESTAMP"
+mkdir $dir1
+mkdir $dir2
+touch $dir1/file{1..100}
+
+rsync -r "$dir1/" "$dir2"
+count=$(ls $dir2 | wc -l)
+[ $count -eq 100 ]; pcheck $?
+
+# Remote rsync test
+if [ ! -z "${RSYNC_HOST:-}" ]; then
+	ptry "Remote rsync test - $TIMESTAMP" -m
+	ptry "Prepare remote rsync test (need sshd)" -s
+	[ -f '.ssh/id_rsa' ] || ssh-keygen -f ~/.ssh/id_rsa -q -N ""
+	ssh-copy-id -o StrictHostKeyChecking=no $RSYNC_HOST &>/dev/null
+	pcheck $? -x
+
+	ptry 'Sync there and back' -s
+	rsync -r "$dir1/" "$RSYNC_HOST:$rdir"; pcheck $?
+	#ssh $RSYNC_HOST "rsync -r $rdir/ root@${HOSTNAME}.qa:$dir3"
+	ptry "rsync -r $rdir/ root@${HOSTNAME}.qa:$dir3" -s
+	read -s
+
+	count=$(ls $dir3 | wc -l)
+	[ $count -eq 100 ]; pcheck $?
+else
+	ptry "Remote rsync test - $TIMESTAMP"
+	pcheck -1;
+fi
+
+
+if ! isopenstack; then
+    ######################################################
+    # Root subvolume points to the first snapshot (bug #946648)
+
+    # This an example of correct output:
+    #   ID 258 gen 42026 top level 257 path @/.snapshots/1/snapshot
+    # This one is not:
+    #   ID 257 gen 220 top level 5 path @
+    ptry 'Root subvolume points to the first snapshot'
+    root_subvolume=$(btrfs subvolume get-default / | tee -a $LOG | awk '{ print $9 }')
+    [ "$root_subvolume" == "@/.snapshots/1/snapshot" ]; pcheck $?
+
+    ######################################################
+    # Snapper
+
+    snapfile="/etc/snapfile-$TIMESTAMP"
+    ptry 'Snapper undochange' -m
+    ptry 'Create first snapshot' -s
+    snapbf=$(snapper create -p -d "before undochange test"); pcheck $?
+    touch "$snapfile"
+    ptry 'Create second snapshot' -s
+    snapaf=$(snapper create -p -d "after undochange test"); pcheck $?
+
+    ptry 'Undochange back' -s
+    info=$(snapper undochange ${snapbf}..${snapaf}); pcheck $?
+    ptry "$info" -s
+    [[ "${info//[!0-9]/}" =~ 0?1 ]]; pcheck $?
+    ptry 'File deleted' -s
+    [ ! -f $snapfile ]; pcheck $?
+
+    ptry 'Undochange forward' -s
+    info=$(snapper undochange ${snapaf}..${snapbf}); pcheck $?
+    ptry "$info" -s
+    [[ "${info//[!0-9]/}" =~ 1?0 ]]; pcheck $?
+    ptry 'File restored' -s
+    [ -f $snapfile ]; pcheck $?
+
+    rm "$snapfile"
+
+    ptry 'No "timeline" snapshots in `snapper list`' -s
+    timeline="$(snapper list | grep -w timeline | tee -a $LOG)"
+    [ -z "$timeline" ]; pcheck $?
+    ptry 'TIMELINE_CREATE is disabled' -s
+    timeline_create="$(grep -i TIMELINE_CREATE.*no /etc/snapper/configs/root | tee -a $LOG)"
+    [ "$timeline_create" ]; pcheck $?
+fi
+
+######################################################
+# Apache & MySQL tests
+
+# Apache
+ptry "Apache test" -m
+ptry "Install Apache" -s
+zypper -n install apache2 >> $LOG; pcheck $?
+# Provide expected content
+rm -f /srv/www/htdocs/index.html
+echo "Lorem ipsum dolor sit amet" > /srv/www/htdocs/index.html
+
+# After installation, apache2 is disabled
+ptry "Apache is disabled by default" -s
+systemctl show -p UnitFileState apache2.service | grep UnitFileState=disabled >> $LOG; pcheck $?
+
+ptry "Start and activate Apache" -s
+systemctl start apache2.service >> $LOG
+systemctl show -p ActiveState apache2.service | grep ActiveState=active >> $LOG; ec1=$?
+systemctl show -p SubState apache2.service | grep SubState=running >> $LOG; ec2=$?
+if [ $ec1 -eq 0 ] && [ $ec2 -eq 0 ]; then
+	pcheck 0
+else
+	pcheck 1
+fi
+ptry "Apache serves the right content" -s
+curl -f -s http://localhost/ | grep "Lorem ipsum dolor sit amet" >> $LOG; pcheck $?
+systemctl stop apache2.service >> $LOG
+
+# MySQL
+ptry "MySQL test" -m
+ptry "Install MySQL" -s
+zypper -n install mysql >> $LOG; pcheck $?
+
+ptry "MySQL is inactive by default" -s
+systemctl status mysql.service | grep inactive >> $LOG; pcheck $?
+
+ptry "MySQL starts correctly" -s
+systemctl start mysql.service >> $LOG
+! systemctl status mysql.service | grep "Syntax error" >> $LOG; pcheck $?
+
+ptry "Query MySQL version" -s
+mysql_q1=$(mysql -s <<< 'SELECT VERSION();')
+mysql_s1=$(mysql -V | awk '{ print $5 }' | tr -d ,)
+[ "$mysql_q1" == "$mysql_s1" ]; pcheck $?
+
+ptry "Query MySQL date" -s
+mysql_q2=$(mysql -s <<< 'SELECT CURRENT_DATE();')
+mysql_s2=$(date +'%Y-%m-%d')
+[ "$mysql_q2" == "$mysql_s2" ]; pcheck $?
+systemctl stop mysql.service >> $LOG
+
+######################################################
+# Check logs
+
+check_problems() {
+	local pr="$1"
+	local pc=$(echo "$pr" | grep -v "^$" | wc -l)
+
+	ptry "Found $pc problems" -s
+	pcheck $pc
+	if [ $pc -gt 0 -a "$VERBOSE" == true ]; then
+		while read line; do
+			pindent
+			echo "$line"
+		done <<< "$pr"
+	fi
+	echo -e "\n${pr}\n" >> $LOG
+}
+
+# $> systemctl --all --state=failed
+#   UNIT                 LOAD   ACTIVE SUB    DESCRIPTION
+# ● cups-browsed.service loaded failed failed Make remote CUPS printers available locally
+# ...
+# 1 loaded units listed.
+ptry "Failed system services" -m
+pr_tmp=$(systemctl --all --state=failed | tee -a $LOG)
+pr=$(echo "$pr_tmp" | grep service)
+unset pr_tmp
+check_problems "$pr"
+
+if dmesg | grep "Hypervisor detected: VMware" >> $LOG; then
+	ptry "VMware specific tests" -m
+	ptry "Services 'vmtoolsd' and 'vgauthd' should run" -s
+	[ $(systemctl status vmtoolsd vgauthd | grep "active (running)" | wc -l) -eq 2 ]; pcheck $?
+	ptry "Guest can receive host's time" -s
+	[ -n "$(vmware-toolbox-cmd stat hosttime)" ] >> $LOG; pcheck $?
+fi
+
+ptry "Problems in dmesg" -m
+pr=$(dmesg -t | grep -i 'error\|warn\|exception\|crash')
+check_problems "$pr"
+
+ptry "Problems in journal" -m
+pr=$(journalctl --no-pager -p 'err' | tail -n +3 \
+	| grep -v 'remove old symlink')
+# https://bugzilla.suse.com/show_bug.cgi?id=965830#c6
+#	| grep -v 'maximum number (72) of children reached')
+check_problems "$pr"
+
+if [ -e /var/log/cloud-init.log ]; then
+    ptry "Problems in cloud-init logs" -m
+    pr=$(grep -i -e error -e warn /var/log/cloud-init* | grep -v 'not currently implemented')
+    check_problems "$pr"
+fi
+
+ptry "Tracebacks in journal" -m
+journalctl | grep -i -A10 Traceback >> $LOG
+pr=$(journalctl | grep -i traceback)
+check_problems "$pr"
+
+ptry "Segmentation faults in journal" -m
+#cores_str='-e SIGSEGV -e "Segmentation fault" -e "dumped core" -e coredump'
+journalctl | egrep -i -A5 -e SIGSEGV -e "Segmentation fault" -e "dumped core" -e coredump >> $LOG
+pr=$(journalctl | egrep -i -e SIGSEGV -e "Segmentation fault" -e "dumped core" -e coredump)
+check_problems "$pr"
+
+ptry "Broken links" -m
+pr=$(find / -type d \( -path /proc -o -path /run -o -path /.snapshots -o -path /var/cache/zypp/raw \) -prune -o -xtype l -print)
+check_problems "$pr"
+
+ptry "Binaries with missing libraries" -m
+myIFS="$IFS"
+IFS=:
+pr=$(for path in $PATH; do
+	for bin in ${path}/*; do
+		missing=$(ldd $bin 2> /dev/null | grep 'not found')
+		[ -n "$missing" ] && echo "Binary $bin is missing following libraries: $missing"
+	done
+done)
+IFS="$myIFS"
+unset myIFS
+check_problems "$pr"
+
+# Many problems reported by rpmverify are "harmless". But:
+# (1) They should have been fixed anyway; and
+# (2) many of them are not (especially unsatisfied dependencies).
+ptry "rpmverify problems" -m
+pr=$(rpmverify -a | grep -v ^missing)
+check_problems "$pr"
+
+# Using Persistent keyword in old systemd - it does not recognize it
+# http://lists.opensuse.org/opensuse-bugs/2014-06/msg01222.html
+# systemd[1]: [/usr/lib/systemd/system/fstrim.timer:8] Unknown lvalue 'Persistent' in section 'Timer'
+
+######################################################
+
+if ! isopenstack; then
+    # Rollback, restart, test if qemu-tools does not exist
+    echo
+    echo 'Rollback if you wish: snapper rollback 4'
+    echo 'Restart and check:'
+    echo '  (a) "qemu-tools" is not installed: rpmquery qemu-tools'
+    echo '  (b) check if the system is registered after rollback: SUSEConnect -s'
+fi
+
+echo -e "\nSUMMARY"
+echo -n "Passed:  "; green $TOK;
+echo -n "Skipped: "; yellow $TSKIP;
+echo -n "Failed:  "; red $TFAIL;
+
+[ $TFAIL -lt 256 ] && exit $TFAIL || exit 255
