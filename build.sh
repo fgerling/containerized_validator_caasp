@@ -10,4 +10,4 @@ then
 	tar xvf $sonobuoy_tar sonobuoy
 fi
 
-podman build -t validator_caasp:latest .
+podman build --no-cache -t validator_caasp:latest .
