@@ -1,0 +1,3 @@
+[submodule "scripts"]
+	path = scripts
+	url = gitlab@gitlab.suse.de:mkravec/scripts.git

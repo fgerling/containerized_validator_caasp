@@ -6,6 +6,8 @@ export SSH_KEY=/app/config/id_shared
 export SCC="INTERNAL-USE-ONLY-xxxxxxxxxxxxxxxx"
 #export RMT="rmt.scc.suse.de"
 export SUFFIX="username-beta5-sono-$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 3)"
+export BASEDIR="/app"
+export WORKDIR="$(mktemp -d "$BASEDIR/cluster/cluster_XXX")"
 
 ## vmware
 export VSPHERE_SERVER="jazz.qa.prv.suse.net"
@@ -30,5 +32,4 @@ if [ -z "$OS_REGION_NAME" ]; then unset OS_REGION_NAME; fi
 export OS_INTERFACE=public
 export OS_IDENTITY_API_VERSION=3
 
-
-
+# vim: set filetype=sh :
