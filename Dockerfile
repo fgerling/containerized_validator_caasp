@@ -28,11 +28,11 @@ RUN zypper in --auto-agree-with-licenses --no-confirm skuba patterns-caasp-Manag
 RUN zypper clean -a
 
 COPY sonobuoy /usr/local/bin/
+COPY scripts /app
+COPY run.sh /app
+
 VOLUME ["/app/cluster"]
 VOLUME ["/app/config"]
-COPY scripts /app
-
 WORKDIR /app
 
-#ENTRYPOINT ["/usr/bin/skuba"]
 ENTRYPOINT ["/app/run.sh"]
