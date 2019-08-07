@@ -7,7 +7,7 @@ sonobuoy_tar="sonobuoy_${SONOBUOY_VERSION}_${SONOBUOY_OS}_${SONOBUOY_ARCH}.tar.g
 if test ! -f ./${sonobuoy_tar}
 then
 	curl -O -L "https://github.com/heptio/sonobuoy/releases/download/v${SONOBUOY_VERSION}/${sonobuoy_tar}"
-	tar xvf $sonobuoy_tar
+	tar xvf $sonobuoy_tar sonobuoy
 fi
 
 podman build -t validator_caasp:latest .
