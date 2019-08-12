@@ -1,8 +1,16 @@
 #! /bin/sh
 
 . /app/config/validator_caasp.conf
+
 eval $(ssh-agent)
 ssh-add "$SSH_KEY"
-#./validator_caasp -i -p vmware -t=join,base,sono -n 3:3 -k
-#./validator_caasp -i -p openstack -t join -n1:1
+
+# copy $SSH_KEY so sonobuoy can run more tests
+if [ -f "$SSH_KEY"];
+then
+	mkdir -p ~/.ssh
+	cp "$SSH_KEY" ~/.ssh/
+fi
+
+# run validator_caasp with all arguments passed to the container
 ./validator_caasp $@
