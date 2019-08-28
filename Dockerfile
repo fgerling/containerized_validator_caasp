@@ -19,7 +19,7 @@ RUN zypper ar --no-gpgcheck "http://download.suse.de/ibs/SUSE/Products/SLE-Modul
 RUN zypper refresh;\
 	zypper dist-upgrade --auto-agree-with-licenses --no-confirm
 ## Deps for validator_caasp
-RUN zypper in --auto-agree-with-licenses --no-confirm openssh sudo tar which curl python3-pip
+RUN zypper in --auto-agree-with-licenses --no-confirm openssh sudo tar which curl python3-pip unzip
 RUN zypper in --auto-agree-with-licenses --no-confirm helm jq libjq1 libonig4
 ## ca needed for openstack
 RUN zypper in --auto-agree-with-licenses --no-confirm ca-certificates-attachmate ca-certificates-microfocus ca-certificates-suse
