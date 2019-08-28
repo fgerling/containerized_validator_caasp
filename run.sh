@@ -12,5 +12,7 @@ then
 	cp "$SSH_KEY" ~/.ssh/
 fi
 
+echo == "$@" ===
 # run validator_caasp with all arguments passed to the container
+./validator_caasp -i
 ./validator_caasp $@
