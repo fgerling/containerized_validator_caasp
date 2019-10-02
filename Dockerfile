@@ -14,12 +14,13 @@ RUN zypper ar --no-gpgcheck "http://download.suse.de/ibs/SUSE/Products/SLE-Modul
 	zypper ar --no-gpgcheck "http://download.suse.de/ibs/SUSE:/SLE-15-SP1:/Update/standard/" GAUPdate;\
 	zypper ar --no-gpgcheck "http://download.suse.de/ibs/SUSE:/SLE-15-SP1:/Update:/Products:/CASP40/standard" Standard;\
 	zypper ar --no-gpgcheck "http://download.suse.de/ibs/SUSE:/SLE-15-SP1:/Update:/Products:/CASP40:/Update/standard" Update;\
+	zypper ar --no-gpgcheck "http://download.suse.de/ibs/SUSE:/SLE-15-SP1:/Update:/Products:/CASP40/standard/SUSE:SLE-15-SP1:Update:Products:CASP40.repo";\
 	zypper ar --no-gpgcheck "http://download.suse.de/ibs/SUSE:/CA/SLE_15_SP1/SUSE:CA.repo"
 
 RUN zypper refresh;\
 	zypper dist-upgrade --auto-agree-with-licenses --no-confirm
 ## Deps for validator_caasp
-RUN zypper in --auto-agree-with-licenses --no-confirm openssh sudo tar which curl python3-pip unzip
+RUN zypper in --auto-agree-with-licenses --no-confirm openssh sudo tar which curl python3-pip unzip netcat-openbsd openldap2-client
 RUN zypper in --auto-agree-with-licenses --no-confirm helm jq libjq1 libonig4
 ## ca needed for openstack
 RUN zypper in --auto-agree-with-licenses --no-confirm ca-certificates-attachmate ca-certificates-microfocus ca-certificates-suse
